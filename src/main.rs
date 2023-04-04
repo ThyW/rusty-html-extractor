@@ -3,6 +3,8 @@ use html2text::render::text_renderer::{PlainDecorator, RichDecorator, TrivialDec
 use std::io::Write;
 use zip::read::ZipArchive;
 
+const EXTRACT_PATH: &'static str = "/tmp/rusty-html-extractor/";
+
 #[derive(Clone, PartialEq, Eq)]
 struct Options {
     width: u32,
@@ -92,11 +94,12 @@ fn parse(opts: Options) -> Result<(), MyError> {
     }
     let file = std::fs::File::open(opts.input_file)?;
     let mut archive = ZipArchive::new(file)?;
+    archive.extract(std::path::PathBuf::from(&EXTRACT_PATH))?;
     let mut output_text = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(opts.output_text_file)?;
+        .open(&opts.output_text_file)?;
     std::fs::create_dir_all(opts.output_dir.clone())?;
     let output_dir = std::path::PathBuf::from(opts.output_dir);
     for i in 0..archive.len() {
@@ -107,8 +110,26 @@ fn parse(opts: Options) -> Result<(), MyError> {
             None => continue,
         };
 
-        if fname.extension().is_some() && fname.extension().unwrap().to_str().unwrap() == "html" {
-            let _ = output_text.write(format!("# begin {}\n", name).as_bytes())?;
+        if fname.to_str().unwrap().ends_with('/') {
+            let new_path = output_dir.clone().join(fname);
+            std::fs::create_dir_all(new_path)?;
+        } else if String::from_utf8(
+            std::process::Command::new("file")
+                .arg(std::path::PathBuf::from(EXTRACT_PATH).join(&name))
+                .output()?
+                .stdout,
+        )
+        .unwrap_or("file".into())
+        .to_lowercase()
+        .contains("html document")
+        {
+            opts.file_artifacts
+                .then(|| {
+                    output_text
+                        .write(format!("# begin {}\n", name).as_bytes())
+                        .ok()
+                })
+                .flatten();
             let html_text = match &opts.output_format[..] {
                 "trivial" => html2text::from_read_with_decorator(
                     archive_file,
@@ -127,11 +148,19 @@ fn parse(opts: Options) -> Result<(), MyError> {
                 ),
                 _ => unreachable!(),
             };
-            output_text.write_all(html_text.as_bytes())?;
-            let _ = output_text.write(format!("# end {}\n", name).as_bytes())?;
-        } else if fname.to_str().unwrap().ends_with('/') {
-            let new_path = output_dir.clone().join(fname);
-            std::fs::create_dir_all(new_path)?;
+            let txt = html_text
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<String>>();
+            output_text.write_all(txt.join("\n").as_bytes())?;
+            opts.file_artifacts
+                .then(|| {
+                    output_text
+                        .write(format!("# end {}\n", name).as_bytes())
+                        .ok()
+                })
+                .flatten();
         } else {
             let mut outfile = std::fs::File::create(output_dir.clone().join(fname))?;
             std::io::copy(&mut archive_file, &mut outfile)?;
@@ -160,7 +189,7 @@ fn main() -> Result<(), MyError> {
             .number_of_values(2)
             .optional_values(false),
     );
-    parser.add_template(
+    let wh = parser.add_template(
         Template::new()
             .matches("-w")
             .matches("--width")
@@ -168,13 +197,13 @@ fn main() -> Result<(), MyError> {
             .optional_values(true)
             .with_help("Allign the output text file to the given width."),
     );
-    parser.add_template(Template::new()
+    let af = parser.add_template(Template::new()
         .matches("-a")
         .matches("--artifacts")
         .number_of_values(0)
         .optional_values(true)
         .with_help("This will insert an information about what file the given snippet originated from in the output text file."));
-    parser.add_template(
+    let ff = parser.add_template(
         Template::new()
             .matches("-f")
             .matches("--format")
@@ -194,14 +223,14 @@ fn main() -> Result<(), MyError> {
                     opts.output_text_file = output_files.values()[0].clone();
                     opts.output_dir = output_files.values()[1].clone();
                 }
-                if pargs.has("-w") {
-                    opts = opts.set_width(pargs.get("-w").unwrap().values()[0].parse()?)
+                if pargs.has_with_id(wh) {
+                    opts = opts.set_width(pargs.get_with_id(wh).unwrap().values()[0].parse()?)
                 }
-                if pargs.has("-a") {
+                if pargs.has_with_id(af) {
                     opts = opts.set_artifacts(true);
                 }
-                if pargs.has("-f") {
-                    let str = pargs.get("-f").unwrap().values()[0].clone();
+                if pargs.has_with_id(ff) {
+                    let str = pargs.get_with_id(ff).unwrap().values()[0].clone();
                     match &str[..] {
                         "plain" => opts = opts.set_format("plain"),
                         "trivial" => opts = opts.set_format("trivial"),
@@ -212,6 +241,7 @@ fn main() -> Result<(), MyError> {
                 if let Err(error) = parse(opts) {
                     println!("ERROR OCCURED: {}", error);
                 }
+                std::fs::remove_dir_all(std::path::PathBuf::from(&EXTRACT_PATH))?;
             }
         }
         Err(e) => println!("{e}"),
